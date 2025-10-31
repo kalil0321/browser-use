@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias, TypeVar, overload
@@ -20,6 +21,8 @@ from browser_use.llm.vercel.serializer import VercelMessageSerializer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
 T = TypeVar('T', bound=BaseModel)
+
+logger = logging.getLogger(__name__)
 
 ChatVercelModel: TypeAlias = Literal[
 	'alibaba/qwen-3-14b',
@@ -208,6 +211,9 @@ class ChatVercel(BaseChatModel):
 			'qwen3-next-80b-a3b-thinking',
 		]
 	)
+
+	# Debug flag
+	debug_with_input: bool = True
 
 	# Client initialization parameters
 	api_key: str | None = None
@@ -410,24 +416,35 @@ class ChatVercel(BaseChatModel):
 					schema = SchemaOptimizer.create_gemini_optimized_schema(output_format)
 					json_instruction = f'\n\nIMPORTANT: You must respond with ONLY a valid JSON object (no markdown, no code blocks, no explanations) that exactly matches this schema:\n{json.dumps(schema, indent=2)}'
 
+					logger.debug(f'[Google/Reasoning Model] Model: {self.model}, Schema: {schema}')
+
 					instruction_added = False
 					if modified_messages and modified_messages[0].role == 'system':
 						if isinstance(modified_messages[0].content, str):
 							modified_messages[0].content += json_instruction
 							instruction_added = True
+							logger.debug('[DEBUG] Added JSON instruction to system message (string)')
 						elif isinstance(modified_messages[0].content, list):
 							modified_messages[0].content.append(ContentPartTextParam(text=json_instruction))
 							instruction_added = True
+							logger.debug(
+								f'[DEBUG] Added JSON instruction to system message (list, parts: {len(modified_messages[0].content)})'
+							)
 					elif modified_messages and modified_messages[-1].role == 'user':
 						if isinstance(modified_messages[-1].content, str):
 							modified_messages[-1].content += json_instruction
 							instruction_added = True
+							logger.debug('[DEBUG] Added JSON instruction to user message (string)')
 						elif isinstance(modified_messages[-1].content, list):
 							modified_messages[-1].content.append(ContentPartTextParam(text=json_instruction))
 							instruction_added = True
+							logger.debug(
+								f'[DEBUG] Added JSON instruction to user message (list, parts: {len(modified_messages[-1].content)})'
+							)
 
 					if not instruction_added:
 						modified_messages.insert(0, SystemMessage(content=json_instruction))
+						logger.debug('[DEBUG] Inserted new system message with JSON instruction')
 
 					vercel_messages = VercelMessageSerializer.serialize_messages(modified_messages)
 
@@ -439,6 +456,16 @@ class ChatVercel(BaseChatModel):
 
 					content = response.choices[0].message.content if response.choices else None
 
+					logger.debug(f'[DEBUG] Received response from model: {self.model}')
+					logger.debug(f'[DEBUG] Raw content length: {len(content) if content else 0}')
+					logger.debug(f'[DEBUG] Finish reason: {response.choices[0].finish_reason if response.choices else None}')
+
+					if self.debug_with_input:
+						print('\n========== LLM OUTPUT ==========')
+						print(content)
+						print('================================\n')
+						input('Press Enter to continue...')
+
 					if not content:
 						raise ModelProviderError(
 							message='No response from model',
@@ -448,12 +475,40 @@ class ChatVercel(BaseChatModel):
 
 					try:
 						text = content.strip()
+						logger.debug(f'[DEBUG] Before markdown cleanup: {text[:200]}')
+
+						original_text = text
+						changes = []
+
 						if text.startswith('```json') and text.endswith('```'):
 							text = text[7:-3].strip()
+							changes.append('Removed ```json markdown wrapper')
+							logger.debug('[DEBUG] Removed ```json markdown wrapper')
 						elif text.startswith('```') and text.endswith('```'):
 							text = text[3:-3].strip()
+							changes.append('Removed ``` markdown wrapper')
+							logger.debug('[DEBUG] Removed ``` markdown wrapper')
+
+						if changes:
+							if self.debug_with_input:
+								print(f'\n[PROCESSING] Applied changes: {"; ".join(changes)}')
+							else:
+								logger.info(f'[PROCESSING] Applied changes: {"; ".join(changes)}')
+
+						if original_text != text:
+							if self.debug_with_input:
+								print(f'\n[PROCESSING] Before: {original_text[:200]}{"..." if len(original_text) > 200 else ""}')
+								print(f'[PROCESSING] After:  {text[:200]}{"..." if len(text) > 200 else ""}')
+							else:
+								logger.debug(
+									f'[PROCESSING] Before: {original_text[:200]}{"..." if len(original_text) > 200 else ""}'
+								)
+								logger.debug(f'[PROCESSING] After:  {text[:200]}{"..." if len(text) > 200 else ""}')
+
+						logger.debug(f'[DEBUG] After markdown cleanup: {text[:200]}')
 
 						parsed_data = json.loads(text)
+						logger.debug('[DEBUG] Successfully parsed JSON')
 						parsed = output_format.model_validate(parsed_data)
 
 						usage = self._get_usage(response)
@@ -464,6 +519,10 @@ class ChatVercel(BaseChatModel):
 						)
 
 					except (json.JSONDecodeError, ValueError) as e:
+						logger.error(f'[ERROR] Failed to parse JSON response: {str(e)}')
+						if self.debug_with_input:
+							print(f'\n[ERROR] Failed to parse JSON response: {str(e)}')
+							input('Press Enter to raise error...')
 						raise ModelProviderError(
 							message=f'Failed to parse JSON response: {str(e)}. Raw response: {content[:200]}',
 							status_code=500,
@@ -472,6 +531,7 @@ class ChatVercel(BaseChatModel):
 
 				else:
 					schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+					logger.debug(f'[Structured Output] Model: {self.model}, Schema: {schema}')
 
 					response_format_schema: JSONSchema = {
 						'name': 'agent_output',
@@ -491,6 +551,16 @@ class ChatVercel(BaseChatModel):
 
 					content = response.choices[0].message.content if response.choices else None
 
+					logger.debug(f'[DEBUG] Received response from model: {self.model}')
+					logger.debug(f'[DEBUG] Raw content length: {len(content) if content else 0}')
+					logger.debug(f'[DEBUG] Finish reason: {response.choices[0].finish_reason if response.choices else None}')
+
+					if self.debug_with_input:
+						print('\n========== LLM OUTPUT ==========')
+						print(content)
+						print('================================\n')
+						input('Press Enter to continue...')
+
 					if not content:
 						raise ModelProviderError(
 							message='Failed to parse structured output from model response - empty or null content',
@@ -500,6 +570,7 @@ class ChatVercel(BaseChatModel):
 
 					usage = self._get_usage(response)
 					parsed = output_format.model_validate_json(content)
+					logger.debug('[DEBUG] Successfully parsed structured output')
 
 					return ChatInvokeCompletion(
 						completion=parsed,
